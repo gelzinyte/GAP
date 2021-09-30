@@ -71,7 +71,7 @@ program gap_fit_program
   endif
   call print('Multispecies support added where requested')
 
-  call fit_n_from_xyz(main_gap_fit) ! counts number of energies, forces, virials. computes number of descriptors and gradients.
+  call fit_n_from_xyz(main_gap_fit) ! counts number of energies, forces, virials, local charges. computes number of descriptors and gradients.
 
   call set_baselines(main_gap_fit) ! sets e0 etc.
 

@@ -67,7 +67,8 @@ module gap_fit_module
      character(len=STRING_LENGTH) :: at_file='', core_ip_args = '', e0_str, local_property0_str, &
      energy_parameter_name, local_property_parameter_name, force_parameter_name, virial_parameter_name, &
      stress_parameter_name, hessian_parameter_name, config_type_parameter_name, sigma_parameter_name, &
-     config_type_sigma_string, core_param_file, gp_file, template_file, force_mask_parameter_name
+     config_type_sigma_string, core_param_file, gp_file, template_file, force_mask_parameter_name, & 
+     local_q_parameter_name
 
      character(len=10240) :: command_line = ''
      real(dp), dimension(total_elements) :: e0, local_property0
@@ -134,7 +135,7 @@ contains
           energy_parameter_name, local_property_parameter_name, force_parameter_name, &
           virial_parameter_name, stress_parameter_name, hessian_parameter_name, &
           config_type_parameter_name, sigma_parameter_name, config_type_sigma_string, &
-          gp_file, template_file, force_mask_parameter_name
+          gp_file, template_file, force_mask_parameter_name, local_q_parameter_name
 
      character(len=STRING_LENGTH) ::  gap_str, verbosity, sparse_method_str, covariance_type_str, e0_method, &
         parameter_name_prefix
@@ -176,6 +177,7 @@ contains
      gp_file => this%gp_file
      template_file => this%template_file
      sparsify_only_no_fit => this%sparsify_only_no_fit
+     local_q_parameter_name => this%local_q_parameter_name
      
      call initialise(params)
      
@@ -217,6 +219,10 @@ contains
      
      call param_register(params, 'energy_parameter_name', 'energy', energy_parameter_name, &
           help_string="Name of energy property in the input XYZ file that describes the data")
+
+      call param_register(params, 'local_q_parameter_name', 'local_q', local_q_parameter_name, &
+          help_string="Name of local charge property in the input XYZ file that describes the data")
+
      
      call param_register(params, 'local_property_parameter_name', 'local_property', local_property_parameter_name, &
           help_string="Name of local_property (column) in the input XYZ file that describes the data")
@@ -304,6 +310,7 @@ contains
         config_type_parameter_name = trim(parameter_name_prefix) // trim(config_type_parameter_name)
         sigma_parameter_name = trim(parameter_name_prefix) // trim(sigma_parameter_name)
         force_mask_parameter_name = trim(parameter_name_prefix) // trim(force_mask_parameter_name)
+        local_q_parameter_name = trim(parameter_name_prefix) // trim(local_q_parameter_name)
      endif
    
      if( len_trim(this%gp_file) > 216 ) then    ! The filename's length is limited to 255 char.s in some filesystem. 
@@ -655,14 +662,15 @@ contains
     type(Atoms) :: at
 
     integer :: n_con
-    logical :: has_ener, has_force, has_virial, has_stress_3_3, has_stress_voigt, has_hessian, has_local_property, has_force_mask, exclude_atom
+    logical :: has_ener, has_force, has_virial, has_stress_3_3, has_stress_voigt, has_hessian, has_local_property, has_force_mask, exclude_atom, has_local_q
     real(dp) :: ener, virial(3,3), stress_3_3(3,3)
     real(dp) :: stress_voigt(6)
     real(dp), pointer, dimension(:,:) :: f, hessian_eigenvector_j
     real(dp), pointer, dimension(:) :: local_property
+    real(dp), pointer, dimension(:) :: local_q
     logical, pointer, dimension(:) :: force_mask
     integer :: i, j, k
-    integer :: n_descriptors, n_cross, n_hessian
+    integer :: n_descriptors, n_cross, n_hessian, n_local_q
 
     allocate(this%n_cross(this%n_coordinate))
     allocate(this%n_descriptors(this%n_coordinate))
@@ -673,6 +681,7 @@ contains
     this%n_force = 0
     this%n_virial = 0
     this%n_hessian = 0
+    this%n_local_q = 0
 
     do n_con = 1, this%n_frame
 
@@ -684,6 +693,7 @@ contains
        has_hessian = get_value(this%at(n_con)%params,"n_"//this%hessian_parameter_name,n_hessian)
        has_local_property = assign_pointer(this%at(n_con),this%local_property_parameter_name, local_property)
        has_force_mask = assign_pointer(this%at(n_con),trim(this%force_mask_parameter_name),force_mask)
+       has_local_q = assign_pointer(this%at(n_con)%params, this%local_q_parameter_name, local_q)
 
        if( has_ener ) then
           this%n_ener = this%n_ener + 1
@@ -719,6 +729,9 @@ contains
        if( has_local_property ) then
           this%n_local_property = this%n_local_property + this%at(n_con)%N
        endif
+
+       if( has_local_q ) then 
+          this%n_local_q = this%n_local_q + this%at(n_con)%N
 
        if( has_local_property .and. ( has_ener .or. has_force .or. has_virial .or. has_hessian ) ) then
           call system_abort("fit_n_from_xyz: local_property and (energy or force or virial or hessian) present in configuration, currently not allowed.")
@@ -835,6 +848,7 @@ contains
     call print("Number of target forces (property name: "//trim(this%force_parameter_name)//") found: "//this%n_force)
     call print("Number of target virials (property name: "//trim(this%virial_parameter_name)//") found: "//this%n_virial)
     call print("Number of target Hessian eigenvalues (property name: "//trim(this%hessian_parameter_name)//") found: "//this%n_hessian)
+    call print("Number of target local charges (property name: "//trim(this%local_q_parameter_name)//") found: "//this%n_local_q)
     call print_title("End of report")
 
     if( this%do_core ) call Initialise(this%core_pot, args_str=this%core_ip_args, param_str=string(this%quip_string))
