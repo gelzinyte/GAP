@@ -7440,6 +7440,10 @@ module descriptors_module
             endif
             f_cut = f_cut * radial_decay
 
+            ! multiply by local charge
+            f_cut = f_cut * at%local_q(j)
+            df_cut = df_cut * at%local_q(j)
+
             do a = 1, this%n_max
                arg_bess = 2.0_dp * this%alpha * r_ij * this%r_basis(a)
                exp_p = exp( -this%alpha*( r_ij + this%r_basis(a) )**2 )
