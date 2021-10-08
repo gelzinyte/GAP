@@ -7394,8 +7394,8 @@ module descriptors_module
             do a = 1, this%n_max
                !SPEED fourier_so3(0,a,i_species)%m(0) = radial_coefficient(0,a) * SphericalYCartesian(0,0,(/0.0_dp, 0.0_dp, 0.0_dp/))
                if( this%central_reference_all_species .or. this%species_Z(i_species) == at%Z(i) .or. this%species_Z(i_species) == 0 ) then
-                  fourier_so3_r(0,a,i_species)%m(0) = this%central_weight * real(radial_coefficient(0,a) * SphericalYCartesian(0,0,(/0.0_dp, 0.0_dp, 0.0_dp/)), dp)
-                  fourier_so3_i(0,a,i_species)%m(0) = this%central_weight * aimag(radial_coefficient(0,a) * SphericalYCartesian(0,0,(/0.0_dp, 0.0_dp, 0.0_dp/)))
+                  fourier_so3_r(0,a,i_species)%m(0) = at%at_gaussian_weight(i) * this%central_weight * real(radial_coefficient(0,a) * SphericalYCartesian(0,0,(/0.0_dp, 0.0_dp, 0.0_dp/)), dp)
+                  fourier_so3_i(0,a,i_species)%m(0) = at%at_gaussian_weight(i) * this%central_weight * aimag(radial_coefficient(0,a) * SphericalYCartesian(0,0,(/0.0_dp, 0.0_dp, 0.0_dp/)))
                else
                   fourier_so3_i(0,a,i_species)%m(0) = 0.0_dp
                   fourier_so3_r(0,a,i_species)%m(0) = 0.0_dp
