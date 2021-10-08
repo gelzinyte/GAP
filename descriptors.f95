@@ -7441,8 +7441,8 @@ module descriptors_module
             f_cut = f_cut * radial_decay
 
             ! multiply by local charge
-            f_cut = f_cut * at%local_q(j)
-            df_cut = df_cut * at%local_q(j)
+            f_cut = f_cut * at%at_gaussian_weight(j)
+            df_cut = df_cut * at%at_gaussian_weight(j)
 
             do a = 1, this%n_max
                arg_bess = 2.0_dp * this%alpha * r_ij * this%r_basis(a)
