@@ -7149,7 +7149,7 @@ module descriptors_module
             help_string="Version of GAP the XML potential file was created")
 
          call param_register(params, 'atom_gaussian_weight_name', 'NONE', atom_gaussian_weight_name, &
-            has_value_target=has_atom_gaussian_weight_name &
+            has_value_target=has_atom_gaussian_weight_name, &
             help_string="Array name from which to read prefactor for atom gaussians in the atomic neighbourhood density")
 
          if (.not. param_read_line(params,args_str,ignore_unknown=.true.,task='soap_calc args_str')) then
