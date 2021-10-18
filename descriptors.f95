@@ -7168,7 +7168,7 @@ module descriptors_module
 
          if( has_atom_gaussian_weight_name ) then 
             if (.not. assign_pointer(at, trim(atom_gaussian_weight_name), atom_gaussian_weight_pointer)) then 
-               RAISE_ERROR("soap_calc did not fint "//trim(atom_gaussian_weight_name)//" property in the atoms object.", error)
+               RAISE_ERROR("soap_calc did not find "//trim(atom_gaussian_weight_name)//" property in the atoms object.", error)
             endif
             call print("got atom gaussian weight")
          else
