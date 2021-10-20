@@ -99,6 +99,8 @@ module gap_fit_module
      logical :: sparse_use_actual_gpcov
      logical :: has_template_file, has_e0, has_local_property0, has_e0_offset
 
+     character(len=STRING_LENGTH) :: descriptor_args_str
+
   endtype gap_fit
      
   private
@@ -149,6 +151,8 @@ contains
 
      integer :: rnd_seed
 
+     character(len=STRING_LENGTH) :: descriptor_args_str 
+
      at_file => this%at_file
      e0_str => this%e0_str
      local_property0_str => this%local_property0_str
@@ -176,7 +180,8 @@ contains
      gp_file => this%gp_file
      template_file => this%template_file
      sparsify_only_no_fit => this%sparsify_only_no_fit
-     
+     descriptor_args_str => this%descriptor_args_str
+         
      call initialise(params)
      
      call param_register(params, 'atoms_filename', '//MANDATORY//', at_file, has_value_target = has_at_file, help_string="XYZ file with fitting configurations", altkey="at_file")
@@ -284,6 +289,8 @@ contains
 
      call param_register(params, 'sparsify_only_no_fit', 'F', sparsify_only_no_fit, &
           help_string="If true, sparsification is done, but no fitting. print the sparse index by adding print_sparse_index=file.dat to the descriptor string.")
+
+     call param_register(params, 'descriptor_args_str', '',  descriptor_args_str, help="Arguments string for descriptor")
      
      if (.not. param_read_args(params, command_line=this%command_line)) then
         call print("gap_fit")
@@ -1109,7 +1116,7 @@ contains
        do i_coordinate = 1, this%n_coordinate
 
           call calc(this%my_descriptor(i_coordinate),this%at(n_con),my_descriptor_data, &
-          do_descriptor=.true.,do_grad_descriptor=has_force .or. has_virial)
+          do_descriptor=.true.,do_grad_descriptor=has_force .or. has_virial, args_str=this%descriptor_args_str)
 
           allocate(xloc(size(my_descriptor_data%x)))
           n_descriptors = n_descriptors + size(my_descriptor_data%x)
