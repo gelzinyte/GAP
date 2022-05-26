@@ -4,7 +4,7 @@
 ! HND X   
 ! HND X
 ! HND X   Portions of GAP were written by Albert Bartok-Partay, Gabor Csanyi, 
-! HND X   Copyright 2006-2021.
+! HND X   and Sascha Klawohn. Copyright 2006-2021.
 ! HND X
 ! HND X   Portions of GAP were written by Noam Bernstein as part of
 ! HND X   his employment for the U.S. Government, and are not subject
@@ -53,8 +53,9 @@ module gp_predict_module
 #ifdef _OPENMP  
    use omp_lib  
 #endif  
-   use system_module, only : dp, qp, optional_default, reallocate, NUMERICAL_ZERO, & 
-       system_timer, string_to_numerical, print_warning, progress, progress_timer, current_times
+   use system_module, only : idp, dp, qp, optional_default, reallocate, NUMERICAL_ZERO, & 
+       system_timer, string_to_numerical, print_warning, progress, progress_timer, &
+       current_times, InOutput, OUTPUT, increase_to_multiple, i2si, PRINT_VERBOSE
    use units_module  
    use linearalgebra_module  
    use extendable_str_module  
@@ -65,6 +66,9 @@ module gp_predict_module
    use FoX_sax, only: xml_t, dictionary_t, haskey, getvalue, parse, &
    open_xml_string, close_xml_t
    use CInOutput_module, only : quip_md5sum
+   use task_manager_module
+   use matrix_module
+   use MPI_context_module, only : scatterv
 
    implicit none
 
@@ -133,10 +137,6 @@ module gp_predict_module
    integer, parameter, public :: GP_SPARSE_CUR_POINTS = 12
    integer, parameter, public :: GP_SPARSE_NONE = 13
 
-   integer, parameter, public :: GP_COVARIANCE_FITC = 1
-   integer, parameter, public :: GP_COVARIANCE_DTC = 2
-
-
    integer, parameter, public :: COVARIANCE_NONE             = 0
    integer, parameter, public :: COVARIANCE_ARD_SE           = 1
    integer, parameter, public :: COVARIANCE_DOT_PRODUCT      = 2
@@ -145,7 +145,7 @@ module gp_predict_module
 
    integer, parameter, public :: PP_Q = 1
 
-   integer, public :: openmp_chunk_size = 1
+   integer, public, save :: openmp_chunk_size = 1000  ! loop iterations per OpenMP thread
 
    type gpCovariance_bond_real_space
 
@@ -260,7 +260,7 @@ module gp_predict_module
       real(dp), dimension(:), allocatable :: sigma_y, sigma_yPrime
       ! estimated error of function values, derivatives
 
-      real(dp), dimension(:,:), allocatable :: covariance_subY_y, covariance_subY_subY, covariance_y_y, inverse_sparse_full
+      real(dp), dimension(:,:), allocatable :: covariance_subY_y, covariance_subY_subY, covariance_y_y
       ! covariance matrix
 
       real(dp), dimension(:), allocatable :: covarianceDiag_y_y, lambda, alpha
@@ -270,20 +270,17 @@ module gp_predict_module
 
       type(gpCoordinates), dimension(:), allocatable :: coordinate
 
-      integer :: covariance_method = GP_COVARIANCE_DTC
+      logical :: do_subY_subY = .true.
+
       logical :: initialised = .false.
 
    endtype gpFull
 
    type gpSparse
-
-      integer :: n_coordinate
-      ! number of different descriptors
-
+      integer :: n_coordinate ! number of different descriptors
       type(gpCoordinates), dimension(:), allocatable :: coordinate
-
       logical :: initialised = .false.
-
+      logical :: fitted = .false.
    endtype gpSparse
 
    type cplx_1d_array
@@ -310,6 +307,8 @@ module gp_predict_module
    character(len=1024), save :: parse_gpCoordinates_label, parse_gpFull_label, parse_gpSparse_label
 
    public :: gpFull, gpSparse
+   public :: gpFull_print_covariances_lambda
+   public :: gpSparse_fit
 
    interface initialise
       module procedure gpSparse_initialise
@@ -703,12 +702,63 @@ module gp_predict_module
 
    subroutine gpSparse_initialise(this, from, error)
       type(gpSparse), intent(inout) :: this
-      type(gpFull), intent(in)  :: from
+      type(gpFull), intent(in) :: from
       integer, optional, intent(out) :: error
 
-      integer :: i_coordinate, i_sparseX, i_global_sparseX, n_globalSparseX, n_globalY, i, j, i_y, i_yPrime, &
-      i_globalY, i_global_yPrime
-#ifdef HAVE_QR      
+      integer :: i
+
+      if( .not. from%initialised ) then
+         RAISE_ERROR('gpSparse_initialise: gpFull object not initialised',error)
+      endif
+
+      if(this%initialised) call finalise(this,error)
+
+      call gpSparse_setParameters(this, from%n_coordinate)
+
+      do i = 1, this%n_coordinate
+         if( from%coordinate(i)%covariance_type == COVARIANCE_BOND_REAL_SPACE ) then
+            call gpCoordinates_setParameters_sparse(this%coordinate(i), &
+                 from%coordinate(i)%d, from%coordinate(i)%n_sparseX, from%coordinate(i)%delta, from%coordinate(i)%f0, covariance_type = from%coordinate(i)%covariance_type, &
+                 sparseX_size_max=maxval(from%coordinate(i)%sparseX_size), error=error)
+         else
+            call gpCoordinates_setParameters_sparse(this%coordinate(i), &
+                 from%coordinate(i)%d, from%coordinate(i)%n_sparseX, from%coordinate(i)%delta, from%coordinate(i)%f0, covariance_type = from%coordinate(i)%covariance_type, &
+                 error=error)
+         endif
+
+         this%coordinate(i)%alpha = 0.0
+         this%coordinate(i)%sparseX = from%coordinate(i)%sparseX
+         this%coordinate(i)%covarianceDiag_sparseX_sparseX = from%coordinate(i)%covarianceDiag_sparseX_sparseX
+
+         if(from%coordinate(i)%covariance_type == COVARIANCE_BOND_REAL_SPACE) then
+            this%coordinate(i)%sparseX_size = from%coordinate(i)%sparseX_size
+         endif
+
+         this%coordinate(i)%theta = from%coordinate(i)%theta
+         this%coordinate(i)%zeta = from%coordinate(i)%zeta
+         this%coordinate(i)%descriptor_str = from%coordinate(i)%descriptor_str
+         this%coordinate(i)%sparseCutoff = from%coordinate(i)%sparseCutoff
+
+         call gpSparse_setPermutations(this,i,from%coordinate(i)%permutations,error)
+      enddo
+
+      this%initialised = .true.
+   end subroutine gpSparse_initialise
+
+   subroutine gpSparse_fit(this, from, task_manager, condition_number_norm, error)
+      type(gpSparse), intent(inout) :: this
+      type(gpFull), intent(inout) :: from  ! actually input; intent(inout) to free memory early
+      type(task_manager_type), intent(in) :: task_manager
+      character(len=*), optional, intent(in) :: condition_number_norm
+      integer, optional, intent(out) :: error
+
+      character(len=STRING_LENGTH) :: my_condition_number_norm
+
+      integer :: i, j, blocksize
+      integer :: i_coordinate, i_sparseX, i_global_sparseX, n_globalSparseX, n_globalY, i_y, i_yPrime, &
+      i_globalY, i_global_yPrime, nlrows
+#ifdef HAVE_QR
+      real(qp) :: rcond
       real(qp), dimension(:,:), allocatable :: c_subYY_sqrtInverseLambda, factor_c_subYsubY, a
       real(qp), dimension(:), allocatable :: globalY, alpha
       type(LA_Matrix) :: LA_c_subYsubY, LA_q_subYsubY
@@ -721,61 +771,66 @@ module gp_predict_module
 
       INIT_ERROR(error)
 
-      if( .not. from%initialised ) then
-         RAISE_ERROR('gpSparse_initialise: gpFull object not initialised',error)
-      endif
-
-      if(this%initialised) call finalise(this,error)
-
-      call gpSparse_setParameters(this, from%n_coordinate)
-
-      do i_coordinate = 1, this%n_coordinate
-
-         if( from%coordinate(i_coordinate)%covariance_type == COVARIANCE_BOND_REAL_SPACE ) then
-            call gpCoordinates_setParameters_sparse(this%coordinate(i_coordinate), &
-                 from%coordinate(i_coordinate)%d, from%coordinate(i_coordinate)%n_sparseX, from%coordinate(i_coordinate)%delta, from%coordinate(i_coordinate)%f0, covariance_type = from%coordinate(i_coordinate)%covariance_type, &  
-                 sparseX_size_max=maxval(from%coordinate(i_coordinate)%sparseX_size), error=error)  
-         else
-            call gpCoordinates_setParameters_sparse(this%coordinate(i_coordinate), &
-                 from%coordinate(i_coordinate)%d, from%coordinate(i_coordinate)%n_sparseX, from%coordinate(i_coordinate)%delta, from%coordinate(i_coordinate)%f0, covariance_type = from%coordinate(i_coordinate)%covariance_type, &
-                 error=error)
-         endif
-
-         this%coordinate(i_coordinate)%sparseX = from%coordinate(i_coordinate)%sparseX
-         this%coordinate(i_coordinate)%covarianceDiag_sparseX_sparseX = from%coordinate(i_coordinate)%covarianceDiag_sparseX_sparseX
-
-         if(from%coordinate(i_coordinate)%covariance_type == COVARIANCE_BOND_REAL_SPACE) then 
-            this%coordinate(i_coordinate)%sparseX_size = from%coordinate(i_coordinate)%sparseX_size
-         endif
-         this%coordinate(i_coordinate)%theta = from%coordinate(i_coordinate)%theta
-         this%coordinate(i_coordinate)%zeta = from%coordinate(i_coordinate)%zeta
-         this%coordinate(i_coordinate)%descriptor_str = from%coordinate(i_coordinate)%descriptor_str
-         this%coordinate(i_coordinate)%sparseCutoff = from%coordinate(i_coordinate)%sparseCutoff
-
-         call gpSparse_setPermutations(this,i_coordinate,from%coordinate(i_coordinate)%permutations,error)
-
-      enddo
+      my_condition_number_norm = optional_default(' ', condition_number_norm)
       
+      call gpSparse_initialise(this, from, error)
+
       n_globalSparseX = from%n_globalSparseX
       n_globalY = from%n_y + from%n_yPrime
 
 #ifdef HAVE_QR
-      allocate( c_subYY_sqrtInverseLambda(n_globalSparseX,n_globalY), factor_c_subYsubY(n_globalSparseX,n_globalSparseX), &
-      a(n_globalY+n_globalSparseX,n_globalSparseX), globalY(n_globalY+n_globalSparseX), alpha(n_globalSparseX) )
-
+      allocate(c_subYY_sqrtInverseLambda(n_globalSparseX,n_globalY))
       call matrix_product_vect_asdiagonal_sub(c_subYY_sqrtInverseLambda,from%covariance_subY_y,sqrt(1.0_qp/from%lambda)) ! O(NM)
-      call initialise(LA_c_subYsubY,from%covariance_subY_subY)
-      call LA_Matrix_Factorise(LA_c_subYsubY,factor_c_subYsubY,error=error)
-      call finalise(LA_c_subYsubY)
+      if (allocated(from%covariance_subY_y)) deallocate(from%covariance_subY_y)  ! free input component to save memory
+      
+      if (from%do_subY_subY) then
+         allocate(factor_c_subYsubY(n_globalSparseX,n_globalSparseX))
+         call initialise(LA_c_subYsubY,from%covariance_subY_subY,use_allocate=.false.)
+         call LA_Matrix_Factorise(LA_c_subYsubY,factor_c_subYsubY,error=error)
+         call finalise(LA_c_subYsubY)
+         if (allocated(from%covariance_subY_subY)) deallocate(from%covariance_subY_subY)  ! free input component to save memory
 
-      do i = 1, n_globalSparseX-1
-         do j = i+1, n_globalSparseX
-            factor_c_subYsubY(j,i) = 0.0_qp
+         do i = 1, n_globalSparseX-1
+            do j = i+1, n_globalSparseX
+               factor_c_subYsubY(j,i) = 0.0_qp
+            end do
          end do
-      end do
+      end if
+
+      allocate(alpha(n_globalSparseX))
+      if (task_manager%active) then
+         blocksize = get_blocksize(task_manager%idata(1), task_manager%unified_workload, n_globalSparseX)
+         nlrows = increase_to_multiple(task_manager%unified_workload, blocksize)
+         i = nlrows - task_manager%unified_workload
+         call print("distA extension: "//i//" "//n_globalSparseX//" memory "//i2si(8_idp * i * n_globalSparseX)//"B", PRINT_VERBOSE)
+         allocate(globalY(nlrows))
+         allocate(a(nlrows,n_globalSparseX))
+         alpha = 0.0_qp
+         globalY = 0.0_qp
+         a = 0.0_qp
+      else
+         allocate(globalY(n_globalY+n_globalSparseX))
+         allocate(a(n_globalY+n_globalSparseX,n_globalSparseX))
+      end if
 
       a(1:n_globalY,:) = transpose(c_subYY_sqrtInverseLambda)
-      a(n_globalY+1:,:) = factor_c_subYsubY
+      if (allocated(c_subYY_sqrtInverseLambda)) deallocate(c_subYY_sqrtInverseLambda)
+
+      if (task_manager%active) then
+         call scatter_shared_task(task_manager, factor_c_subYsubY, a, n_globalY, n_globalSparseX, from%do_subY_subY)
+      else
+         a(n_globalY+1:,:) = factor_c_subYsubY
+      end if
+      if (allocated(factor_c_subYsubY)) deallocate(factor_c_subYsubY)
+
+      if (my_condition_number_norm(1:1) /= ' ') then
+         if (task_manager%active) then
+            call print_warning("Condition number of distributed matrix is not implemented.")
+         else
+            rcond = matrix_condition_number(a, my_condition_number_norm(1:1))
+            call print("Condition number (log10) of matrix A (norm "//my_condition_number_norm(1:1)//"): "//-log10(rcond))
+         end if
+      end if
 
       globalY = 0.0_qp
       do i_y = 1, from%n_y
@@ -796,9 +851,15 @@ module gp_predict_module
          globalY(i_global_yPrime) = from%yPrime(i_yPrime)*sqrt(1.0_qp/from%lambda(i_global_yPrime))
       enddo
 
-      call initialise(LA_q_subYsubY,a)
-      call LA_Matrix_QR_Solve_Vector(LA_q_subYsubY,globalY,alpha)
-      call finalise(LA_q_subYsubY)
+      if (task_manager%active) then
+         call print("Using ScaLAPACK to solve QR")
+         call SP_Matrix_QR_Solve(a, globalY, alpha, task_manager%ScaLAPACK_obj, blocksize)
+      else
+         call print("Using LAPACK to solve QR")
+         call initialise(LA_q_subYsubY, a, use_allocate=.false.)
+         call LA_Matrix_QR_Solve_Vector(LA_q_subYsubY, globalY, alpha)
+         call finalise(LA_q_subYsubY)
+      end if
 
       do i_coordinate = 1, from%n_coordinate
          do i_sparseX = 1, from%coordinate(i_coordinate)%n_sparseX
@@ -807,8 +868,6 @@ module gp_predict_module
          enddo
       enddo
 
-      if(allocated(c_subYY_sqrtInverseLambda)) deallocate(c_subYY_sqrtInverseLambda)
-      if(allocated(factor_c_subYsubY)) deallocate(factor_c_subYsubY)
       if(allocated(a)) deallocate(a)
       if(allocated(globalY)) deallocate(globalY)
       if(allocated(alpha)) deallocate(alpha)
@@ -858,10 +917,77 @@ module gp_predict_module
       if(allocated(alpha)) deallocate(alpha)
       if(allocated(globalY)) deallocate(globalY)
 #endif
+      this%fitted = .true.
 
-      this%initialised = .true.
+   endsubroutine gpSparse_fit
 
-   endsubroutine gpSparse_initialise
+   ! put L part at the end of local A (take info from last task of each worker)
+   subroutine scatter_shared_task(task_manager, factor_c_subYsubY, a, n_globalY, n_globalSparseX, do_subY_subY)
+      type(task_manager_type), intent(in) :: task_manager
+      real(qp), intent(inout) :: factor_c_subYsubY(:,:)
+      real(qp), intent(inout) :: a(:,:)
+      integer, intent(in) :: n_globalY
+      integer, intent(in) :: n_globalSparseX
+      logical, intent(in) :: do_subY_subY
+
+      integer :: n, t, w
+      integer, allocatable :: counts(:)
+      real(dp), allocatable :: tmp(:,:)
+
+      ! scattering works with cols, so transposing input and output
+      if (do_subY_subY) then
+         factor_c_subYsubY = transpose(factor_c_subYsubY)
+         call get_shared_task_counts(task_manager, n_globalSparseX, counts)
+      else
+         allocate(counts(1), source=0)
+      end if
+
+      w = task_manager%my_worker_id
+      t = task_manager%workers(w)%n_tasks
+      n = task_manager%workers(w)%tasks(t)%idata(1)
+      allocate(tmp(n_globalSparseX,n))
+      tmp = 0.0_dp
+
+      call scatterv(task_manager%MPI_obj, factor_c_subYsubY, tmp, counts)
+      a(n_globalY+1:n_globalY+n,:) = transpose(tmp)
+   end subroutine scatter_shared_task
+
+   subroutine get_shared_task_counts(task_manager, ncols, counts)
+      type(task_manager_type), intent(in) :: task_manager
+      integer, intent(in) :: ncols
+      integer, intent(out), allocatable :: counts(:)
+
+      integer :: n, o, t, w
+
+      allocate(counts(task_manager%n_workers))
+      counts = 0
+      o = 0
+      do w = 1, task_manager%n_workers
+         t = task_manager%workers(w)%n_tasks
+         n = task_manager%workers(w)%tasks(t)%idata(1)
+         counts(w) = n * ncols
+         o = o + n
+         if (o > ncols) then
+            counts(w) = (n - (o - ncols)) * ncols
+            call print_warning("get_shared_task_counts: Not enough data. &
+               &Were sparse points reduced since task distribution?")
+            exit
+         end if
+      end do
+   end subroutine get_shared_task_counts
+
+   function get_blocksize(arg, nrows, ncols) result(blocksize)
+      integer, intent(in) :: arg, nrows, ncols
+      integer :: blocksize
+
+      integer, parameter :: OVERHEAD_FACTOR = 2  ! worst case: +1/2=50% matrix size
+
+      if (arg > 0) then
+         blocksize = arg
+      else
+         blocksize = merge(nrows, ncols, (nrows < ncols * OVERHEAD_FACTOR))
+      end if
+   end function get_blocksize
 
    subroutine gpSparse_finalise(this,error)
       type(gpSparse), intent(inout) :: this
@@ -871,12 +997,16 @@ module gp_predict_module
 
       INIT_ERROR(error)
 
-      do i_coordinate = 1, this%n_coordinate
-         call finalise(this%coordinate(i_coordinate), error)
-      enddo
-      deallocate(this%coordinate)
+      if (allocated(this%coordinate)) then
+         do i_coordinate = 1, this%n_coordinate
+            call finalise(this%coordinate(i_coordinate), error)
+         enddo
+         deallocate(this%coordinate)
+      end if
 
       this%n_coordinate = 0
+      this%initialised = .false.
+      this%fitted = .false.
 
    endsubroutine gpSparse_finalise
 
@@ -908,8 +1038,6 @@ module gp_predict_module
       if(allocated(this%covarianceDiag_y_y)) deallocate( this%covarianceDiag_y_y )
       if(allocated(this%lambda)) deallocate( this%lambda )
       if(allocated(this%alpha)) deallocate( this%alpha )
-      if(allocated(this%inverse_sparse_full)) deallocate( this%inverse_sparse_full )
-
 
       this%n_coordinate = 0
       this%n_y = 0
@@ -1470,17 +1598,12 @@ module gp_predict_module
    subroutine gpFull_covarianceMatrix_sparse(this,error)
       type(gpFull), intent(inout), target :: this
       integer, optional, intent(out) :: error
+
       integer :: i_coordinate, i_global_sparseX, j_global_sparseX, i_sparseX, j_sparseX, &
-      n_globalY, i_globalY, i_global_yPrime, i_y, i_yPrime, i_x, j_x, n_x, i_xPrime, j_xPrime, n_xPrime, n, i
-      real(dp) :: covariance_xPrime_sparseX, covariance_x_x_single, covariance_xPrime_xPrime, fc_i, fc_j, dfc_i, dfc_j
-      real(dp), dimension(:,:,:,:), allocatable :: grad2_Covariance
-      real(dp), dimension(:,:,:), allocatable :: grad_Covariance_j
-      real(dp), dimension(:,:), allocatable :: grad_Covariance_i, covariance_x_x
+      n_globalY, i_globalY, i_global_yPrime, i_y, i_yPrime, i_x, j_x, n_x, i_xPrime, j_xPrime, n_xPrime
+      real(dp) :: covariance_xPrime_sparseX
+      real(dp), dimension(:,:), allocatable :: grad_Covariance_i
       real(dp), dimension(:), allocatable :: covariance_x_sparseX, covariance_subY_currentX_y, covariance_subY_currentX_suby
-      real(dp), dimension(:), pointer :: xPrime_i, xPrime_j
-      integer, dimension(:), allocatable :: xIndex, xPrime_Index, xPrime_x_Index
-      type(LA_matrix) :: LA_covariance_subY_subY
-      logical :: found_i_x
       real(dp) :: start_time, cpu_time, wall_time
 
       
@@ -1502,6 +1625,14 @@ module gp_predict_module
 
          if( .not. this%coordinate(i_coordinate)%sparsified ) then
             RAISE_ERROR('gpFull_covarianceMatrix: '//i_coordinate//'th coordinate object not sparsified',error)
+         endif
+
+         if( .not. allocated(this%coordinate(i_coordinate)%x) ) then
+            RAISE_ERROR('gpFull_covarianceMatrix: '//i_coordinate//"th coordinate's x not allocated",error)
+         endif
+
+         if( .not. allocated(this%coordinate(i_coordinate)%xPrime) ) then
+            RAISE_ERROR('gpFull_covarianceMatrix: '//i_coordinate//"th coordinate's xPrime not allocated",error)
          endif
 
          if(this%coordinate(i_coordinate)%covariance_type == COVARIANCE_BOND_REAL_SPACE) then
@@ -1534,14 +1665,18 @@ module gp_predict_module
          this%map_yPrime_globalY(i_yPrime) = i_globalY
       enddo
 
+      if (this%do_subY_subY) then
+         call reallocate(this%covariance_subY_subY, this%n_globalSparseX, this%n_globalSparseX, zero = .true.)
+      else
+         call reallocate(this%covariance_subY_subY, 1, 1, zero = .true.)
+      end if
+
       call reallocate(this%covariance_subY_y, this%n_globalSparseX, n_globalY, zero = .true.)
-      call reallocate(this%covariance_subY_subY, this%n_globalSparseX, this%n_globalSparseX, zero = .true.)
       call reallocate(this%covarianceDiag_y_y, n_globalY, zero = .true.)
       call reallocate(this%lambda, n_globalY, zero = .true.)
-      call reallocate(this%inverse_sparse_full, this%n_globalSparseX, n_globalY, zero = .true.)
 
-      allocate( covariance_subY_currentX_y(n_globalY),covariance_subY_currentX_suby(this%n_globalSparseX) )	
-      covariance_subY_currentX_y = 0.0_dp	
+      allocate( covariance_subY_currentX_y(n_globalY),covariance_subY_currentX_suby(this%n_globalSparseX) )
+      covariance_subY_currentX_y = 0.0_dp
       covariance_subY_currentX_suby = 0.0_dp
 
       do i_coordinate = 1, this%n_coordinate
@@ -1622,9 +1757,12 @@ module gp_predict_module
                gpCoordinates_Covariance(this%coordinate(i_coordinate), j_sparseX = j_sparseX, i_sparseX = i_sparseX) * this%coordinate(i_coordinate)%sparseCutoff(i_sparseX)*this%coordinate(i_coordinate)%sparseCutoff(j_sparseX)
             enddo
 
-            this%covariance_subY_subY(i_global_sparseX,i_global_sparseX) = this%covariance_subY_subY(i_global_sparseX,i_global_sparseX) + this%sparse_jitter
+            if (this%do_subY_subY) then
+               this%covariance_subY_subY(i_global_sparseX,i_global_sparseX) = this%covariance_subY_subY(i_global_sparseX,i_global_sparseX) + this%sparse_jitter
+               this%covariance_subY_subY(:,i_global_sparseX) = this%covariance_subY_subY(:,i_global_sparseX) + covariance_subY_currentX_suby
+            end if
+
             this%covariance_subY_y(i_global_sparseX,:) = this%covariance_subY_y(i_global_sparseX,:) + covariance_subY_currentX_y
-            this%covariance_subY_subY(:,i_global_sparseX) = this%covariance_subY_subY(:,i_global_sparseX) + covariance_subY_currentX_suby
 
             call current_times(cpu_time, wall_time)
             if(mod(i_sparseX,100) == 0) call progress_timer(this%coordinate(i_coordinate)%n_sparseX, i_sparseX, "Covariance matrix", wall_time-start_time)
@@ -1634,171 +1772,15 @@ module gp_predict_module
          call print('Finished sparse covariance matrix calculation of coordinate '//i_coordinate)
          call system_timer('gpFull_covarianceMatrix_sparse_Coordinate'//i_coordinate//'_sparse')
 
-         select case(this%covariance_method)
-         case(GP_COVARIANCE_FITC)
-            call system_timer('gpFull_covarianceMatrix_sparse_Coordinate'//i_coordinate//'_diag')
-            do i_y = 1, this%n_y
-               ! loop over all function values
+         this%covarianceDiag_y_y = 0.0_dp
 
-               i_globalY = this%map_y_globalY(i_y)
-               ! find unique function value/derivative identifier
-
-               n_x = count( this%coordinate(i_coordinate)%map_x_y == i_y )
-               allocate(xIndex(n_x))
-               
-               n = 1
-               do i = 1, size(this%coordinate(i_coordinate)%map_x_y)
-                  if(this%coordinate(i_coordinate)%map_x_y(i) == i_y) then
-                     xIndex(n) = i
-                     n = n+1
-                  endif
-               enddo
-
-               ! construct index array of all contributions to a given function value
-
-               do i_x = 1, n_x
-                  do j_x = 1, n_x
-                     covariance_x_x_single = gpCoordinates_Covariance( this%coordinate(i_coordinate), i_x = xIndex(i_x), j_x = xIndex(j_x) ) * &
-                     this%coordinate(i_coordinate)%cutoff(xIndex(i_x))*this%coordinate(i_coordinate)%cutoff(xIndex(j_x))
-                     this%covarianceDiag_y_y(i_globalY) = this%covarianceDiag_y_y(i_globalY) + covariance_x_x_single
-                  enddo
-               enddo
-               deallocate(xIndex)
-            enddo
-            call system_timer('gpFull_covarianceMatrix_sparse_Coordinate'//i_coordinate//'_diag')
-
-            call system_timer('gpFull_covarianceMatrix_sparse_Coordinate'//i_coordinate//'_grad_diag')
-
-            do i_yPrime = 1, this%n_yPrime
-               ! loop over all derivative values
-               i_global_yPrime = this%map_yPrime_globalY(i_yPrime)
-               ! find unique function value/derivative identifier
-
-               !n_xPrime = count( this%coordinate(i_coordinate)%map_xPrime_yPrime == i_yPrime )
-               allocate(xPrime_Index(size(this%coordinate(i_coordinate)%map_xPrime_yPrime)))
-               
-               ! construct index array of all contributions to a given derivative value
-               n = 0
-               do i = 1, size(this%coordinate(i_coordinate)%map_xPrime_yPrime)
-                  if(this%coordinate(i_coordinate)%map_xPrime_yPrime(i) == i_yPrime) then
-                     n = n + 1
-                     xPrime_Index(n) = i
-                  endif
-               enddo
-               n_xPrime = n
-               call reallocate(xPrime_Index,n_xPrime,copy=.true.)
-
-               ! xIndex: for each xPrime that contributes to the given i_yPrime, this contains the indices 
-               ! of the x in the main database. Length is less or equal to the number of xPrimes.
-               ! xPrime_x_Index: this is the inverse of xIndex, i.e. for each xPrime this contains the index
-               ! of x in xIndex.
-               allocate(xPrime_x_Index(n_xPrime),xIndex(n_xPrime))
-               xIndex = -1
-               n_x = 1
-               xIndex(1) = this%coordinate(i_coordinate)%map_xPrime_x(xPrime_Index(1))
-               xPrime_x_Index(1) = 1
-               ! Search started off.
-               do i_xPrime = 2, n_xPrime
-                  i_x = this%coordinate(i_coordinate)%map_xPrime_x(xPrime_Index(i_xPrime))
-                  found_i_x = .false.
-                  do i = 1, n_x
-                     if(xIndex(i) == i_x) then
-                        xPrime_x_Index(i_xPrime) = i
-                        found_i_x = .true.
-                        exit
-                     endif
-                  enddo
-                  if(.not. found_i_x) then
-                     n_x = n_x + 1
-                     xIndex(n_x) = i_x
-                     xPrime_x_Index(i_xPrime) = n_x
-                  endif
-
-                  !if( any(xIndex(:n_x) == i_x) ) then
-                  !   do i = 1, n_x
-                  !      if(xIndex(i) == i_x) xPrime_x_Index(i_xPrime) = i
-                  !   enddo
-                  !   cycle
-                  !else
-                  !   n_x = n_x + 1
-                  !   xIndex(n_x) = i_x
-                  !   xPrime_x_Index(i_xPrime) = n_x
-                  !endif
-               enddo
-               call reallocate(xIndex,n_x,copy=.true.)
-
-
-               allocate( grad2_Covariance(this%coordinate(i_coordinate)%d,this%coordinate(i_coordinate)%d,n_x,n_x), &
-              grad_Covariance_j(this%coordinate(i_coordinate)%d,n_x,n_x), covariance_x_x(n_x,n_x) ) !, &
-   !            xPrime_i_grad2_Covariance(this%coordinate(i_coordinate)%d) )
-               grad2_Covariance = 0.0_dp
-               do i_x = 1, n_x
-                  do j_x = 1, n_x
-                     covariance_x_x(j_x,i_x) = gpCoordinates_Covariance( this%coordinate(i_coordinate), i_x = xIndex(i_x), j_x = xIndex(j_x), &
-                     grad_Covariance_j = grad_Covariance_j(:,j_x,i_x), grad2_Covariance=grad2_Covariance(:,:,j_x,i_x) )
-                  enddo
-               enddo
-
-               do i_xPrime = 1, n_xPrime
-                  i_x = xPrime_x_Index(i_xPrime)
-                  xPrime_i => this%coordinate(i_coordinate)%xPrime(:,xPrime_Index(i_xPrime))
-                  
-                  fc_i = this%coordinate(i_coordinate)%cutoff(xIndex(i_x))
-                  dfc_i = this%coordinate(i_coordinate)%cutoffPrime(xPrime_Index(i_xPrime))
-                  do j_xPrime = 1, n_xPrime
-                     j_x = xPrime_x_Index(j_xPrime)
-                     xPrime_j => this%coordinate(i_coordinate)%xPrime(:,xPrime_Index(j_xPrime))
-
-                     fc_j = this%coordinate(i_coordinate)%cutoff(xIndex(j_x))
-                     dfc_j = this%coordinate(i_coordinate)%cutoffPrime(xPrime_Index(j_xPrime))
-
-                     covariance_xPrime_xPrime = dot_product(matmul(xPrime_i,grad2_Covariance(:,:,j_x,i_x)),xPrime_j)*&
-                     fc_i*fc_j + &
-                     dot_product(grad_Covariance_j(:,j_x,i_x),xPrime_i)*fc_i*dfc_j + &
-                     dot_product(grad_Covariance_j(:,j_x,i_x),xPrime_j)*fc_j*dfc_i + &
-                     covariance_x_x(j_x,i_x)*dfc_i*dfc_j
-                     !gpCoordinates_Covariance( this%coordinate(i_coordinate), i_xPrime = xPrime_Index(i_xPrime), j_xPrime = xPrime_Index(j_xPrime) )
-                     this%covarianceDiag_y_y(i_global_yPrime) = this%covarianceDiag_y_y(i_global_yPrime) + covariance_xPrime_xPrime
-                  enddo
-               enddo
-
-               if(allocated(xPrime_Index)) deallocate(xPrime_Index)
-               if(allocated(xIndex)) deallocate(xIndex)
-               if(allocated(xPrime_x_Index)) deallocate(xPrime_x_Index)
-               if(allocated(grad2_Covariance)) deallocate(grad2_Covariance)
-               if(allocated(grad_Covariance_j)) deallocate(grad_Covariance_j)
-               if(allocated(covariance_x_x)) deallocate(covariance_x_x)
-            enddo
-            call system_timer('gpFull_covarianceMatrix_sparse_Coordinate'//i_coordinate//'_grad_diag')
-         case(GP_COVARIANCE_DTC)
-            this%covarianceDiag_y_y = 0.0_dp
-         case default
-            this%covarianceDiag_y_y = 0.0_dp
-         endselect
-
+         if (allocated(this%coordinate(i_coordinate)%x)) deallocate(this%coordinate(i_coordinate)%x)
+         if (allocated(this%coordinate(i_coordinate)%xPrime)) deallocate(this%coordinate(i_coordinate)%xPrime)
          call system_timer('gpFull_covarianceMatrix_sparse_Coordinate'//i_coordinate)
       enddo
 
-      call system_timer('gpFull_covarianceMatrix_sparse_LinearAlgebra')
-      call initialise(LA_covariance_subY_subY,this%covariance_subY_subY)
-      call Matrix_Solve(LA_covariance_subY_subY, this%covariance_subY_y, this%inverse_sparse_full,error=error)
-      call finalise(LA_covariance_subY_subY)
-      call system_timer('gpFull_covarianceMatrix_sparse_LinearAlgebra')
-
       call system_timer('gpFull_covarianceMatrix_sparse_FunctionValues')
-      select case(this%covariance_method)
-      case(GP_COVARIANCE_FITC)
-         do i_globalY = 1, n_globalY
-            ! loop over all function values
-
-            this%lambda(i_globalY) = this%covarianceDiag_y_y(i_globalY) - &
-               dot_product( this%inverse_sparse_full(:,i_globalY), this%covariance_subY_y(:,i_globalY) )
-         enddo
-      case(GP_COVARIANCE_DTC)
-         this%lambda = 0.0_dp
-      case default
-         this%lambda = 0.0_dp
-      endselect
+      this%lambda = 0.0_dp
 
       do i_y = 1, this%n_y
          ! loop over all function values
@@ -3742,9 +3724,12 @@ module gp_predict_module
 !         end do  
          
          k(:) = this%delta**2 * fast_pow_1d(covariance_x_xStars(:), this%zeta)
+
+         k = k * this%sparseCutoff
          if(present(gradPredict)) then
             allocate(alpha_scaled(size(this%alpha)))
             alpha_scaled(:) = this%alpha(:) * this%delta**2 * this%zeta * fast_pow_1d(covariance_x_xStars, this%zeta-1.0_dp)
+            alpha_scaled = alpha_scaled * this%sparseCutoff
          endif
          deallocate(covariance_x_xStars)
 
@@ -3992,17 +3977,19 @@ module gp_predict_module
           k_mm = 0.0_dp
           do i = 1, this%n_sparseX
              x_i => this%sparseX(:,i)
+             fc_i => this%sparseCutoff(i)
              do j = i, this%n_sparseX
                 x_j => this%sparseX(:,j)
+                fc_j => this%sparseCutoff(j)
                 if(this%covariance_type == COVARIANCE_BOND_REAL_SPACE) then
                    if( .not. this%initialised ) then
                       RAISE_ERROR('gpCoordinates_initialise_variance_estimate: bond real space sparse score not implemented', error)
                    endif
                 elseif(this%covariance_type == COVARIANCE_DOT_PRODUCT) then
                    if( zeta_int .feq. this%zeta ) then
-                      k_mm(j,i) = sum( x_i * x_j )**zeta_int
+                      k_mm(j,i) = fc_i*fc_i * sum( x_i * x_j )**zeta_int
                    else
-                      k_mm(j,i) = sum( x_i * x_j )**this%zeta
+                      k_mm(j,i) = fc_i*fc_i * sum( x_i * x_j )**this%zeta
                    endif
                 elseif( this%covariance_type == COVARIANCE_ARD_SE ) then
                    do i_p = 1, this%n_permutations
@@ -4112,6 +4099,29 @@ module gp_predict_module
       call fwrite_array_d(size(this%sparseX), this%sparseX(1,1), trim(sparseX_filename)//C_NULL_CHAR)
 
    end subroutine gpCoordinates_print_sparseX_file
+
+   ! print covariances and lambda to process-dependent files, one value per line
+   subroutine gpFull_print_covariances_lambda(this, file_prefix, my_proc, do_Kmm)
+      type(gpFull), intent(in) :: this
+      character(*), intent(in) :: file_prefix
+      integer, intent(in) :: my_proc
+      logical, intent(in) :: do_Kmm
+
+      call fwrite_array_d(size(this%covariance_subY_y), this%covariance_subY_y, trim(file_prefix)//'_Kmn.'//my_proc//C_NULL_CHAR)
+      call fwrite_array_d(size(this%lambda), this%lambda, trim(file_prefix)//'_lambda.'//my_proc//C_NULL_CHAR)
+
+      if (.not. do_Kmm) return
+      if (.not. this%do_subY_subY) then
+         call print_warning("gpFull_print_covariances_lambda: Called to print Kmm but do_subY_subY is false.")
+         return
+      end if
+      if (.not. allocated(this%covariance_subY_subY)) then
+         call print_warning("gpFull_print_covariances_lambda: Called to print Kmm but not allocated.")
+         return
+     end if
+ 
+      call fwrite_array_d(size(this%covariance_subY_subY), this%covariance_subY_subY, trim(file_prefix)//'_Kmm'//C_NULL_CHAR)
+   end subroutine gpFull_print_covariances_lambda
 
    subroutine gpCoordinates_printXML(this,xf,label,sparseX_base_filename,error)
       type(gpCoordinates), intent(in) :: this
@@ -4319,6 +4329,7 @@ module gp_predict_module
       if(present(label)) call xml_AddAttribute(xf,"label", trim(label))
 
       call xml_AddAttribute(xf,"n_coordinate", ""//this%n_coordinate)
+      call xml_AddAttribute(xf,"fitted", ""//this%fitted)
 
       do i = 1, this%n_coordinate
          call gpCoordinates_printXML(this%coordinate(i),xf,label=trim(optional_default("",label))//i,&
@@ -5133,8 +5144,14 @@ module gp_predict_module
             else
                call system_abort("gpSparse_startElement_handler did not find the n_coordinate attribute.")
             endif
-
             call gpSparse_setParameters(parse_gpSparse,n_coordinate)
+
+            call GP_FoX_get_value(attributes, 'fitted', value, status)
+            if (status == 0) then
+               read (value,*) parse_gpSparse%fitted
+            else
+               parse_gpSparse%fitted = .true.  ! for backward compatibility
+            endif
 
          endif
 
