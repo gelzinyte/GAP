@@ -345,7 +345,7 @@ contains
      call param_register(params, 'sparsify_only_no_fit', 'F', sparsify_only_no_fit, &
           help_string="If true, sparsification is done, but no fitting. print the sparse index by adding print_sparse_index=file.dat to the descriptor string.")
 
-     call param_register(params, 'descriptor_args_str', '',  descriptor_args_str, help="Arguments string for descriptor")
+     call param_register(params, 'descriptor_args_str', ' ',  descriptor_args_str, help="Arguments string for descriptor")
      
      call param_register(params, 'condition_number_norm', ' ', condition_number_norm, &
           help_string="Norm for condition number of matrix A; O: 1-norm, I: inf-norm, <space>: skip calculation (default)")
