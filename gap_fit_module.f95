@@ -182,7 +182,12 @@ contains
      integer :: rnd_seed
      integer, pointer :: mpi_blocksize
 
-     character(len=STRING_LENGTH) :: descriptor_args_str 
+   ! this was the bug, I think
+   !   character(len=STRING_LENGTH) :: descriptor_args_str 
+     character(len=STRING_LENGTH), pointer :: descriptor_args_str 
+
+   
+
 
      config_file => this%config_file
      at_file => this%at_file
