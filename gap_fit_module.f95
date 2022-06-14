@@ -116,6 +116,8 @@ module gap_fit_module
      logical :: sparse_use_actual_gpcov
      logical :: has_template_file, has_e0, has_local_property0, has_e0_offset, has_linear_system_dump_file
 
+     character(len=STRING_LENGTH) :: descriptor_args_str
+
   endtype gap_fit
      
   private
@@ -180,6 +182,12 @@ contains
      integer :: rnd_seed
      integer, pointer :: mpi_blocksize
 
+   ! this was the bug, I think
+   !   character(len=STRING_LENGTH) :: descriptor_args_str 
+     character(len=STRING_LENGTH), pointer :: descriptor_args_str 
+     logical :: has_descriptor_args_str
+
+
      config_file => this%config_file
      at_file => this%at_file
      e0_str => this%e0_str
@@ -208,6 +216,8 @@ contains
      gp_file => this%gp_file
      template_file => this%template_file
      sparsify_only_no_fit => this%sparsify_only_no_fit
+     descriptor_args_str => this%descriptor_args_str
+
      condition_number_norm => this%condition_number_norm
      linear_system_dump_file => this%linear_system_dump_file
      mpi_blocksize => this%mpi_blocksize
@@ -331,9 +341,12 @@ contains
      call param_register(params, 'template_file', 'template.xyz', template_file, has_value_target=this%has_template_file, &
           help_string="Template XYZ file for initialising object")
 
+     call param_register(params, 'descriptor_args_str', '', descriptor_args_str,  &
+          help_string="Arguments string for descriptor")
+
      call param_register(params, 'sparsify_only_no_fit', 'F', sparsify_only_no_fit, &
           help_string="If true, sparsification is done, but no fitting. print the sparse index by adding print_sparse_index=file.dat to the descriptor string.")
-     
+
      call param_register(params, 'condition_number_norm', ' ', condition_number_norm, &
           help_string="Norm for condition number of matrix A; O: 1-norm, I: inf-norm, <space>: skip calculation (default)")
 
@@ -1217,7 +1230,9 @@ contains
        do i_coordinate = 1, this%n_coordinate
 
           call calc(this%my_descriptor(i_coordinate),this%at(n_con),my_descriptor_data, &
-          do_descriptor=.true.,do_grad_descriptor=has_force .or. has_virial)
+          do_descriptor=.true.,do_grad_descriptor=has_force .or. has_virial, args_str=this%descriptor_args_str)
+         !  old: check this if doesn't work
+         !  do_descriptor=.true.,do_grad_descriptor=has_force .or. has_virial)
 
           allocate(xloc(size(my_descriptor_data%x)))
           n_descriptors = n_descriptors + size(my_descriptor_data%x)

@@ -7140,6 +7140,11 @@ module descriptors_module
       complex(dp), allocatable, save :: sphericalycartesian_all_t(:,:), gradsphericalycartesian_all_t(:,:,:)
       complex(dp) :: c_tmp(3)
       integer :: max_n_neigh
+
+      character(len=STRING_LENGTH) :: atom_gaussian_weight_name
+      real(dp), dimension(:), pointer :: atom_gaussian_weight_pointer
+      logical :: has_atom_gaussian_weight_name
+
 !$omp threadprivate(radial_fun, radial_coefficient, grad_radial_fun, grad_radial_coefficient)
 !$omp threadprivate(sphericalycartesian_all_t, gradsphericalycartesian_all_t)
 !$omp threadprivate(fourier_so3_r, fourier_so3_i)
@@ -7172,6 +7177,10 @@ module descriptors_module
       has_atom_mask_name = .false. ! allow atom mask column in the atom table
       atom_mask_pointer => null()  ! allow atom mask column in the atom table
       xml_version = 1423143769     ! This is the version number where the 2l+1 normalisation of soap vectors was introduced
+
+      has_atom_gaussian_weight_name = .false.
+      atom_gaussian_weight_pointer => null()
+
       if(present(args_str)) then
          call initialise(params)
          
@@ -7181,6 +7190,10 @@ module descriptors_module
 
          call param_register(params, 'xml_version', '1423143769', xml_version, &
             help_string="Version of GAP the XML potential file was created")
+
+         call param_register(params, 'atom_gaussian_weight_name', 'NONE', atom_gaussian_weight_name, &
+            has_value_target=has_atom_gaussian_weight_name, &
+            help_string="Array name from which to read prefactor for atom gaussians in the atomic neighbourhood density")
 
          if (.not. param_read_line(params,args_str,ignore_unknown=.true.,task='soap_calc args_str')) then
             RAISE_ERROR("soap_calc failed to parse args_str='"//trim(args_str)//"'", error)
@@ -7194,6 +7207,17 @@ module descriptors_module
             endif
          else
             atom_mask_pointer => null()
+         endif
+
+         if( has_atom_gaussian_weight_name ) then 
+            if (.not. assign_pointer(at, trim(atom_gaussian_weight_name), atom_gaussian_weight_pointer)) then 
+               RAISE_ERROR("soap_calc did not find "//trim(atom_gaussian_weight_name)//" property in the atoms object.", error)
+            endif
+            call print("got atom gaussian weight")
+         else
+            atom_mask_pointer => null()  ! this would have been null anyway, so why to reassign it to null?
+            call print("DID NOT get atom gaussian weight")
+
          endif
 
       endif
@@ -7396,8 +7420,10 @@ module descriptors_module
          global_fourier_so3_i_array = 0.0_dp
       endif ! this%global 
 
+! not sure if "atom_gaussian_weight_pointer has to be shared or if that's what messes things up?
 !$omp parallel do schedule(dynamic) default(none) shared(this, at, descriptor_out, my_do_descriptor, my_do_grad_descriptor, d, i_desc, species_map, rs_index, do_two_l_plus_one) &
 !$omp shared(global_grad_fourier_so3_r_array, global_grad_fourier_so3_i_array, norm_radial_decay) &
+!$omp shared(atom_gaussian_weight_pointer) & 
 !$omp private(i, j, i_species, j_species, a, b, l, m, n, n_i, r_ij, u_ij, d_ij, shift_ij, i_pow, i_coeff, ia, jb, alpha, i_desc_i) &
 !$omp private(c_tmp) &
 !$omp private(t_g_r, t_g_i, t_f_r, t_f_i, t_g_f_rr, t_g_f_ii) &
@@ -7438,6 +7464,12 @@ module descriptors_module
                if( this%central_reference_all_species .or. this%species_Z(i_species) == at%Z(i) .or. this%species_Z(i_species) == 0 ) then
                   fourier_so3_r(0,a,i_species)%m(0) = this%central_weight * real(radial_coefficient(0,a) * SphericalYCartesian(0,0,(/0.0_dp, 0.0_dp, 0.0_dp/)), dp)
                   fourier_so3_i(0,a,i_species)%m(0) = this%central_weight * aimag(radial_coefficient(0,a) * SphericalYCartesian(0,0,(/0.0_dp, 0.0_dp, 0.0_dp/)))
+
+                  if(associated(atom_gaussian_weight_pointer)) then 
+                     fourier_so3_r(0,a,i_species)%m(0) = fourier_so3_r(0,a,i_species)%m(0) * atom_gaussian_weight_pointer(i)
+                     fourier_so3_i(0,a,i_species)%m(0) = fourier_so3_i(0,a,i_species)%m(0) * atom_gaussian_weight_pointer(i)
+                  endif
+
                else
                   fourier_so3_i(0,a,i_species)%m(0) = 0.0_dp
                   fourier_so3_r(0,a,i_species)%m(0) = 0.0_dp
@@ -7481,6 +7513,11 @@ module descriptors_module
                df_cut = df_cut * radial_decay + f_cut * dradial_decay
             endif
             f_cut = f_cut * radial_decay
+
+            if(associated(atom_gaussian_weight_pointer)) then 
+               f_cut = f_cut * atom_gaussian_weight_pointer(j)
+               df_cut = df_cut * atom_gaussian_weight_pointer(j)
+            endif
 
             do a = 1, this%n_max
                arg_bess = 2.0_dp * this%alpha * r_ij * this%r_basis(a)
